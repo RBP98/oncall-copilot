@@ -1,4 +1,4 @@
-\# On-Call Copilot (Local)
+# On-Call Copilot (Local)
 
 
 
@@ -12,7 +12,7 @@ A local end-to-end “on-call copilot” prototype that answers incident-style q
 
 
 
-\## Stack
+## Stack
 
 \- Minikube (Docker driver)
 
@@ -26,13 +26,13 @@ A local end-to-end “on-call copilot” prototype that answers incident-style q
 
 
 
-\## Quickstart (Windows PowerShell)
+## Quickstart (Windows PowerShell)
 
 See: `docs/oncall-copilot-command-reference-windows.docx`
 
 
 
-\## Example Questions
+## Example Questions
 
 \- Why are we seeing errors?
 
