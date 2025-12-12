@@ -1,0 +1,6 @@
+prometheus:
+  prometheusSpec:
+    serviceMonitorNamespaceSelector: {}   # allow discovering ServiceMonitors in any namespace
+    serviceMonitorSelector:
+      matchLabels:
+        release: monitoring               # we will label our ServiceMonitor with this
