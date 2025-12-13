@@ -6,6 +6,9 @@ from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 
+from copilot.providers.llm.factory import create_llm_provider
+
+
 PROM_URL = "http://localhost:9090"  # via port-forward
 QDRANT_URL = "http://localhost:6333"
 COLLECTION = "runbooks"
@@ -49,9 +52,13 @@ def docs_search(q: str, top_k=3):
 
 
 def prom_query(promql: str):
-    r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": promql}, timeout=10)
-    r.raise_for_status()
-    return r.json()["data"]["result"]
+    try:
+        r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": promql}, timeout=3)
+        r.raise_for_status()
+        return r.json()["data"]["result"]
+    except Exception as e:
+        return {"error": str(e), "query": promql}
+
 
 @app.post("/chat")
 def chat(inp: ChatIn):
@@ -82,15 +89,60 @@ def chat(inp: ChatIn):
         diagnosis.append("5xx errors are occurring on /error (check logs for repeating error lines).")
     if p95:
         diagnosis.append("p95 latency for /slow is elevated (likely intentional delay or resource pressure).")
+        
+    pods_summary = [{"name": p["metadata"]["name"], "phase": p["status"]["phase"]} for p in pods]
+
+    prompt = f"""
+        You are an on-call copilot. Use ONLY the evidence provided.
+        If something is missing, say what is missing and what command to run next.
+
+        Question:
+        {inp.question}
+
+        Evidence: Top runbook chunks (docs_top):
+        {docs}
+
+        Evidence: Kubernetes pods:
+        {pods_summary}
+
+        Evidence: Recent logs (logs_tail):
+        {logs}
+
+        Evidence: Prometheus metrics:
+        error_rate_query: {err_q}
+        error_rate_result: {err}
+        p95_query: {p95_q}
+        p95_result: {p95}
+
+        Return:
+        1) Most likely cause (1–3 bullets)
+        2) Evidence (cite runbook source filenames + mention log lines/metric results you used)
+        3) Immediate next steps (3–6 bullets)
+        """
+
+    narrative = None
+    try:
+        llm = create_llm_provider()
+        if llm:
+            narrative = llm.generate(prompt)
+    except Exception as e:
+        narrative = f"(LLM unavailable: {e})"
+
 
     return {
         "question": inp.question,
+        "narrative": narrative,
         "likely_findings": diagnosis or ["No obvious issue detected from quick checks."],
         "evidence": {
             "docs_top": docs,
-            "pods": [{"name": p["metadata"]["name"], "phase": p["status"]["phase"]} for p in pods],
+            "pods": pods_summary,
             "logs_tail": logs,
-            "prometheus": {"error_rate_query": err_q, "error_rate_result": err, "p95_query": p95_q, "p95_result": p95},
+            "prometheus": {
+                "error_rate_query": err_q,
+                "error_rate_result": err,
+                "p95_query": p95_q,
+                "p95_result": p95
+            },
         },
         "next_steps": [
             "If errors: inspect logs_tail for repeated error patterns and correlate with metrics spike time.",
@@ -98,3 +150,4 @@ def chat(inp: ChatIn):
             "Later: plug in an LLMProvider to turn evidence into a polished narrative."
         ]
     }
+
