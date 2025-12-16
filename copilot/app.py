@@ -1,124 +1,113 @@
 import json
-import subprocess
-import requests
 from fastapi import FastAPI
 from pydantic import BaseModel
-from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer
 
 from copilot.providers.llm.factory import create_llm_provider
 
+from copilot.tools.docs_tool import search as docs_search, DocsSearchArgs
+from copilot.tools.k8s_tool import get_pods, get_logs, K8sGetPodsArgs, K8sGetLogsArgs
+from copilot.tools.prom_tool import query as prom_query, PromQueryArgs
 
-PROM_URL = "http://localhost:9090"  # via port-forward
-QDRANT_URL = "http://localhost:6333"
-COLLECTION = "runbooks"
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+from copilot.agent_loop import run_agent
 
 app = FastAPI(title="oncall-copilot")
 
-qdrant = QdrantClient(url=QDRANT_URL)
-embedder = SentenceTransformer(EMBED_MODEL)
 
 class ChatIn(BaseModel):
     question: str
     namespace: str = "oncall"
     app_label: str = "demo-app"
 
-def sh(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        return f"ERROR running {cmd}: {r.stderr}"
-    return r.stdout
+@app.post("/agent_chat")
+def agent_chat(inp: ChatIn):
+    llm = create_llm_provider()
+    if not llm:
+        return {"question": inp.question, "final": "LLM_PROVIDER is not set; agent mode requires an LLM.", "trace": [], "evidence": {}}
 
-def docs_search(q: str, top_k=3):
-    vec = embedder.encode(q).tolist()
-
-    res = qdrant.query_points(
-        collection_name=COLLECTION,
-        query=vec,
-        limit=top_k,
-        with_payload=True,
-    )
-
-    hits = res.points
-    return [
-        {
-            "source": h.payload.get("source"),
-            "text": h.payload.get("text"),
-            "score": h.score,
-        }
-        for h in hits
-    ]
-
-
-def prom_query(promql: str):
-    try:
-        r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": promql}, timeout=3)
-        r.raise_for_status()
-        return r.json()["data"]["result"]
-    except Exception as e:
-        return {"error": str(e), "query": promql}
-
+    out = run_agent(inp.question, inp.namespace, inp.app_label, llm)
+    return {"question": inp.question, **out}
 
 @app.post("/chat")
 def chat(inp: ChatIn):
+    tool_trace = []
+
     # 1) Pull docs
-    docs = docs_search(inp.question)
+    docs_env = docs_search(DocsSearchArgs(question=inp.question, top_k=3))
+    tool_trace.append(docs_env)
+
+    docs = []
+    if docs_env.result and "chunks" in docs_env.result:
+        docs = docs_env.result["chunks"]
 
     # 2) K8s state
-    pods_json = sh(["kubectl", "get", "pods", "-n", inp.namespace, "-l", f"app={inp.app_label}", "-o", "json"])
-    pods = json.loads(pods_json).get("items", []) if pods_json.strip().startswith("{") else []
-    pod_names = [p["metadata"]["name"] for p in pods]
+    pods_env = get_pods(K8sGetPodsArgs(namespace=inp.namespace, app_label=inp.app_label, limit=50))
+    tool_trace.append(pods_env)
+
+    pods_summary = []
+    pod_names = []
+    if pods_env.result and "pods" in pods_env.result:
+        pods_summary = pods_env.result["pods"]
+        pod_names = [p["name"] for p in pods_summary if p.get("name")]
 
     # 3) Logs (last ~80 lines each)
     logs = {}
+    logs_envs = []
     for pn in pod_names[:2]:
-        logs[pn] = sh(["kubectl", "logs", "-n", inp.namespace, pn, "--tail=80"])
+        env = get_logs(K8sGetLogsArgs(namespace=inp.namespace, pod_name=pn, tail_lines=80))
+        logs_envs.append(env)
+        tool_trace.append(env)
+        if env.result and "logs_tail" in env.result:
+            logs[pn] = env.result["logs_tail"]
+        else:
+            logs[pn] = f"(no logs: {env.error.message if env.error else 'unknown'})"
 
     # 4) Metrics: error rate + p95 slow latency
     err_q = 'rate(demo_http_requests_total{path="/error",status="500"}[2m])'
     p95_q = 'histogram_quantile(0.95, sum by (le) (rate(demo_http_request_duration_seconds_bucket{path="/slow"}[5m])))'
-    err = prom_query(err_q)
-    p95 = prom_query(p95_q)
 
-    # 5) Simple diagnosis (LLM can replace this later)
+    err_env = prom_query(PromQueryArgs(promql=err_q))
+    p95_env = prom_query(PromQueryArgs(promql=p95_q))
+    tool_trace.extend([err_env, p95_env])
+
+    err = err_env.result.get("result") if err_env.result else {"error": err_env.error.message if err_env.error else "unknown"}
+    p95 = p95_env.result.get("result") if p95_env.result else {"error": p95_env.error.message if p95_env.error else "unknown"}
+
+    # 5) Simple diagnosis (still deterministic)
     diagnosis = []
-    if any("CrashLoopBackOff" in sh(["kubectl","get","pods","-n",inp.namespace]).strip() for _ in [0]):
-        diagnosis.append("Pods appear to be crash-looping (check events/logs).")
+    if any((p.get("waiting_reason") == "CrashLoopBackOff") for p in pods_summary):
+        diagnosis.append("Pods appear to be crash-looping (CrashLoopBackOff reported; check logs/events).")
     if err:
         diagnosis.append("5xx errors are occurring on /error (check logs for repeating error lines).")
     if p95:
         diagnosis.append("p95 latency for /slow is elevated (likely intentional delay or resource pressure).")
-        
-    pods_summary = [{"name": p["metadata"]["name"], "phase": p["status"]["phase"]} for p in pods]
 
     prompt = f"""
-        You are an on-call copilot. Use ONLY the evidence provided.
-        If something is missing, say what is missing and what command to run next.
+You are an on-call copilot. Use ONLY the evidence provided.
+If something is missing, say what is missing and what command to run next.
 
-        Question:
-        {inp.question}
+Question:
+{inp.question}
 
-        Evidence: Top runbook chunks (docs_top):
-        {docs}
+Evidence: Top runbook chunks (docs_top):
+{docs}
 
-        Evidence: Kubernetes pods:
-        {pods_summary}
+Evidence: Kubernetes pods:
+{pods_summary}
 
-        Evidence: Recent logs (logs_tail):
-        {logs}
+Evidence: Recent logs (logs_tail):
+{logs}
 
-        Evidence: Prometheus metrics:
-        error_rate_query: {err_q}
-        error_rate_result: {err}
-        p95_query: {p95_q}
-        p95_result: {p95}
+Evidence: Prometheus metrics:
+error_rate_query: {err_q}
+error_rate_result: {err}
+p95_query: {p95_q}
+p95_result: {p95}
 
-        Return:
-        1) Most likely cause (1–3 bullets)
-        2) Evidence (cite runbook source filenames + mention log lines/metric results you used)
-        3) Immediate next steps (3–6 bullets)
-        """
+Return:
+1) Most likely cause (1–3 bullets)
+2) Evidence (cite runbook source filenames + mention log lines/metric results you used)
+3) Immediate next steps (3–6 bullets)
+""".strip()
 
     narrative = None
     try:
@@ -127,7 +116,6 @@ def chat(inp: ChatIn):
             narrative = llm.generate(prompt)
     except Exception as e:
         narrative = f"(LLM unavailable: {e})"
-
 
     return {
         "question": inp.question,
@@ -141,13 +129,14 @@ def chat(inp: ChatIn):
                 "error_rate_query": err_q,
                 "error_rate_result": err,
                 "p95_query": p95_q,
-                "p95_result": p95
+                "p95_result": p95,
             },
         },
+        # Phase 1 bonus: you now have a tool trace ready for Phase 2 agent loops
+        "tool_trace": [t.model_dump() if hasattr(t, "model_dump") else t.dict() for t in tool_trace],
         "next_steps": [
             "If errors: inspect logs_tail for repeated error patterns and correlate with metrics spike time.",
             "If slow: check pod CPU/memory and consider adding resource limits/throttling to simulate pressure.",
-            "Later: plug in an LLMProvider to turn evidence into a polished narrative."
-        ]
+            "Later: plug in an LLMProvider to turn evidence into a polished narrative.",
+        ],
     }
-

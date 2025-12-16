@@ -15,7 +15,7 @@ class GeminiProvider(LLMProvider):
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
-        model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         client = genai.Client(api_key=api_key)
         return cls(client=client, model=model)
 
