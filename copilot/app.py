@@ -24,8 +24,11 @@ def agent_chat(inp: ChatIn):
     if not llm:
         return {"question": inp.question, "final": "LLM_PROVIDER is not set; agent mode requires an LLM.", "trace": [], "evidence": {}}
 
-    out = run_agent(inp.question, inp.namespace, inp.app_label, llm)
-    return {"question": inp.question, **out}
+    try:
+        out = run_agent(inp.question, inp.namespace, inp.app_label, llm)
+        return {"question": inp.question, **out}
+    except Exception as e:
+        return {"question": inp.question, "final": f"(LLM unavailable: {e})", "trace": [], "evidence": {}}
 
 @app.post("/chat")
 def chat(inp: ChatIn):
