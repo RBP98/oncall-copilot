@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 
 import json
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -17,6 +18,7 @@ ERR_Q = 'rate(demo_http_requests_total{path="/error",status="500"}[2m])'
 P95_Q = 'histogram_quantile(0.95, sum by (le) (rate(demo_http_request_duration_seconds_bucket{path="/slow"}[5m])))'
 PROMQL_ALLOWLIST = {ERR_Q, P95_Q}
 
+USE_LLM_PLANNER = os.getenv("COPILOT_AGENT_USE_LLM_PLANNER", "0") == "1"
 
 class AgentAction(BaseModel):
     type: Literal["tool", "final"]
@@ -24,6 +26,22 @@ class AgentAction(BaseModel):
     tool_args: Optional[Dict[str, Any]] = None
     final: Optional[str] = None
 
+
+def _deterministic_next_action(missing: Dict[str, bool], trace: List[Dict[str, Any]], question: str, namespace: str, app_label: str) -> AgentAction:
+    if missing["docs"]:
+        return AgentAction(type="tool", tool_name="docs.search", tool_args={"question": question, "top_k": 3})
+    if missing["pods"]:
+        return AgentAction(type="tool", tool_name="k8s.get_pods", tool_args={"namespace": namespace, "app_label": app_label, "limit": 50})
+    if missing["logs"]:
+        pn = _first_pod_name(trace)
+        if pn:
+            return AgentAction(type="tool", tool_name="k8s.get_logs", tool_args={"namespace": namespace, "pod_name": pn, "tail_lines": 80})
+        return AgentAction(type="tool", tool_name="k8s.get_pods", tool_args={"namespace": namespace, "app_label": app_label, "limit": 50})
+    if missing["err_metric"]:
+        return AgentAction(type="tool", tool_name="prom.query", tool_args={"promql": ERR_Q})
+    if missing["p95_metric"]:
+        return AgentAction(type="tool", tool_name="prom.query", tool_args={"promql": P95_Q})
+    return AgentAction(type="final", final="")
 
 def _as_dict(x: Any) -> Dict[str, Any]:
     if hasattr(x, "model_dump"):
@@ -169,29 +187,59 @@ Context:
     for step in range(MAX_STEPS):
         missing = _missing_summary(trace)
 
-        prompt = f"""
-{system}
+        # ✅ If all evidence is collected, call LLM ONCE to write final narrative
+        if not any(missing.values()):
+            evidence = _build_evidence_from_trace(trace)
+            final_prompt = f"""
+    You are an on-call copilot. Use ONLY the evidence provided.
+    If something is missing, say what is missing and what tool/command you'd run next.
 
-USER QUESTION:
-{question}
+    Question:
+    {question}
 
-MISSING EVIDENCE:
-{json.dumps(missing, indent=2)}
+    Evidence (JSON):
+    {json.dumps(evidence, separators=(",", ":"))}
 
-TOOL TRACE (last 8):
-{json.dumps(trace[-8:], indent=2)}
-""".strip()
+    Return:
+    1) Most likely cause (1–3 bullets)
+    2) Evidence used (cite which logs/metrics/runbook chunks)
+    3) Immediate next steps (3–6 bullets)
+    """.strip()
 
-        raw = llm.generate(prompt, meta={"mode": "agent", "step": step})
-        try:
-            action = AgentAction(**_extract_json_object(raw))
-        except (ValueError, json.JSONDecodeError, ValidationError) as e:
-            return {
-                "final": f"Agent failed to produce a valid JSON action. Raw:\n{raw}",
-                "trace": trace,
-                "evidence": _build_evidence_from_trace(trace),
-                "error": str(e),
-            }
+            try:
+                final_text = llm.generate(final_prompt, meta={"mode": "agent_final"})
+            except Exception as e:
+                final_text = f"(LLM unavailable/rate-limited: {e})\n\nReturning gathered evidence only."
+            return {"final": final_text, "trace": trace, "evidence": evidence}
+
+        # ✅ Default (recommended): deterministic tool selection (no LLM planning)
+        if not USE_LLM_PLANNER:
+            action = _deterministic_next_action(missing, trace, question, namespace, app_label)
+        else:
+            # If you *really* want LLM planning, keep it but make it cheaper:
+            prompt = f"""
+    {system}
+
+    USER QUESTION:
+    {question}
+
+    MISSING EVIDENCE:
+    {json.dumps(missing, separators=(",", ":"))}
+
+    TOOL TRACE (last 3):
+    {json.dumps(trace[-3:], separators=(",", ":"))}
+    """.strip()
+
+            raw = llm.generate(prompt, meta={"mode": "agent", "step": step})
+            try:
+                action = AgentAction(**_extract_json_object(raw))
+            except (ValueError, json.JSONDecodeError, ValidationError) as e:
+                return {
+                    "final": f"Agent failed to produce a valid JSON action. Raw:\n{raw}",
+                    "trace": trace,
+                    "evidence": _build_evidence_from_trace(trace),
+                    "error": str(e),
+                }
 
         # ✅ Guardrail: don't allow "final" until minimum evidence is present
         # (otherwise the model will confidently guess)
